@@ -11,25 +11,21 @@
 # Keras include(s)
 from keras.models import Model
 from keras.layers import Dense, Input
-from keras.optimizers import SGD
+from keras.optimizers import SGD, Adam
 
 # Local include(s)
 from layers import *
 
-
-# Definitions for both models
-num_nodes_f = 32 
-num_nodes_r = 32
-
-# Create optimisers for each main model
+# Learning configurations
 params = {
-    'lambda':  70.,
-    'lr':       0.01,
-    'momentum': 0.9,
+    'lambda':    1000.,
+    'lr':        1E-03, # Learning rate (LR) in the classifier model
+    'lr_ratio':  1E+03, # Ratio of the LR in adversarial model to that in the classifier
 }
 
-c_optim = SGD(lr = params['lr'], momentum = params['momentum'], nesterov = True)
-d_optim = SGD(lr = params['lr'], momentum = params['momentum'], nesterov = True)
+# Create optimisers for each main model
+clf_optim = Adam(lr=params['lr'], decay=1E-03)
+adv_optim = Adam(lr=params['lr'], decay=1E-03)
 
 # Define compiler options
 opts = {
@@ -37,75 +33,68 @@ opts = {
     # Classifier
     'classifier' : {
         'loss': 'binary_crossentropy',
-        'optimizer': 'SGD',
+        'optimizer': clf_optim, #'SGD',
     },
 
-    # Discriminator
-    'discriminator' : {
-        'loss': 'binary_crossentropy',
-        'optimizer': d_optim,
-    },
-
-    # Combined model
-    'combined' : {
+    # Adversarial (combined)
+    'adversarial' : {
         'loss': ['binary_crossentropy', 'binary_crossentropy'],
-        'optimizer': c_optim,
-        'loss_weights': [1., -params['lambda']],
-    }
+        'optimizer': adv_optim,
+        'loss_weights': [1, params['lr_ratio']],
+    },
 
 }
 
 
-def classifier_model (num_params): # ..., arch):
+def adversarial_model (classifier, architecture, num_posterior_components, num_posterior_dimensions):
+    """ ... """
+
+    # Classifier
+    classifier.trainable = True
+   
+    # Adversary
+    # -- Gradient reversal
+    l = GradientReversalLayer(params['lambda'] / float(params['lr_ratio']))(classifier.output)
+
+    # -- De-correlation inputs
+    input_decorrelation = Input(shape=(num_posterior_dimensions,), name='input_adversary')
+
+    # -- Intermediate layer(s)
+    for ilayer, (nodes, activation) in enumerate(architecture):
+        l = Dense(nodes, activation=activation, name='dense_adversary_%d' % ilayer)(l)
+        pass
+
+    # -- Posterior p.d.f. parameters
+    r_coeffs = Dense(num_posterior_components, name='coeffs_adversary', activation='softmax')(l)
+    r_means  = list()
+    r_widths = list()
+    for i in xrange(num_posterior_dimensions):
+        r_means .append( Dense(num_posterior_components, name='mean_adversary_P%d'  % i)(l) )
+        pass
+    for i in xrange(num_posterior_dimensions):
+        r_widths.append( Dense(num_posterior_components, name='width_adversary_P%d' % i, activation='softplus')(l) )
+        pass
+
+    # -- Posterior probability layer
+    output_adversary = Posterior(num_posterior_components, num_posterior_dimensions, name='adversary')([r_coeffs] + r_means + r_widths + [input_decorrelation])
+    
+    return Model(input=[classifier.input] + [input_decorrelation], output=[classifier.output, output_adversary], name='combined')
+
+
+def classifier_model (num_params, architecture):
     """ Returns an instance of a classifier-type model (f) """
     
     # Input(s)
-    input_f = Input(shape = (num_params,), name = 'input_f')
+    classifier_input = Input(shape=(num_params,), name='input_classifier')
 
     # Layer(s)
-    f_1 = Dense(num_nodes_f, activation = 'relu')(input_f)
-    f_2 = Dense(num_nodes_f, activation = 'relu')(f_1)
-    f_3 = Dense(num_nodes_f, activation = 'relu')(f_2)
-    f_4 = Dense(num_nodes_f, activation = 'relu')(f_3)
-    
-    # Output(s)
-    output_f = Dense(1, activation = 'sigmoid', name = 'output_f')(f_4)
-
-    # Model
-    return Model(input = input_f, output = output_f, name = 'classifier')
-
-
-def discriminator_model (num_components): # ..., arch):
-    """ Returns an instance of a discriminator-type model (r) """
-    
-    # Input(s)
-    input_r      = Input(shape = (1,), name = 'input_r')
-    input_masses = Input(shape = (1,), name = 'input_masses')
-
-    # Layer(s)
-    r_1 = Dense(num_nodes_r, activation = 'relu')(input_r)
-    r_2 = Dense(num_nodes_r, activation = 'relu')(r_1)
-    r_3 = Dense(num_nodes_r, activation = 'relu')(r_2)
-    r_4 = Dense(num_nodes_r, activation = 'relu')(r_3)
-    r_coeffs = Dense(num_components, activation = 'softmax')(r_4)
-    r_means  = Dense(num_components)(r_4) 
-    r_widths = Dense(num_components, activation = 'softplus')(r_4)
+    l = classifier_input
+    for ilayer, (nodes, activation) in enumerate(architecture):
+        l = Dense(nodes, activation=activation, name='dense_classifier_%d' % ilayer)(l)
+        pass
 
     # Output(s)
-    output_r  = Posterior(1, num_components, name = 'output_r')([r_coeffs, r_means, r_widths, input_masses])
+    classifier_output = Dense(1, activation='sigmoid', name='classifier')(l)
 
     # Model
-    return Model(input = [input_r, input_masses], output = output_r, name = 'discriminator')
-
-
-def combined_model (classifier, discriminator):
-    """ Returns an instance of the combined model, merging the input classifier- and discriminator model. 
-    Inspired by [https://github.com/jacobgil/keras-dcgan/blob/master/dcgan.py] 
-    """
-
-    combined = Model(input  = [classifier.input,  discriminator.input[1]], 
-                     output = [classifier.output, discriminator([classifier.output, discriminator.input[1]])],
-                     name = 'combined')
-
-    return combined
-    
+    return Model(input=classifier_input, output=classifier_output, name='classifier')

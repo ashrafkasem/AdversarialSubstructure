@@ -11,6 +11,7 @@
 
 # Basic include(s)
 import sys
+import json
 
 # Scientific include(s)
 # -- Numpy
@@ -24,9 +25,13 @@ from matplotlib.colors import LogNorm
 from keras import backend as K_
 from keras.models import load_model
 from keras.utils.visualize_util import plot
-    
+from keras.callbacks import Callback, LearningRateScheduler, ReduceLROnPlateau
+
 # -- Scikit-learn
 from sklearn import preprocessing
+
+# -- Scipy
+from scipy.signal import savgol_filter
 
 # Local include(s)
 from utils import *
@@ -42,14 +47,17 @@ def main ():
     # Whether to continue training where last round left off
     resume = False
 
+    retrain_classifier = True
+
 
     # Get data
     # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 
-    input_vars = ['m', 'tau21', 'D2']
-    X, Y, W, signal, background = getData(sys.argv, input_vars)
+    substructure_vars  = ['jet_tau21', 'jet_D2', 'jet_m']
+    decorrelation_vars = ['jet_m'] 
+    X, Y, W, P, signal, background, names = getData(decorrelation_vars)
 
-
+  
     # Split into train and test sample
     # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
     
@@ -68,23 +76,22 @@ def main ():
     X_train, X_test = X[msk,:], X[~msk,:]
     Y_train, Y_test = Y[msk],   Y[~msk]
     W_train, W_test = W[msk],   W[~msk]
+    P_train, P_test = P[msk,:], P[~msk,:]
     
-    # Get mass index
-    idx_m = input_vars.index('m')
     
-
     # Define training data sampler
     # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––    
 
     def sampler (size_batch = 1.0, num_batches = 1, replace = True):
-        """ ... """
+        """ Generator to produce random, shuffled subsets of the training data. (Probably super inefficient in practice) """
 
         # Check(s)
         if type(size_batch) is int:
             if not replace:
-                assert frac <= num_train, "The requested number of samples (%d) is larger than the number of unique training samples (%d)." % (frac, num_train)
+                assert size_batch <= num_train, "The requested number of samples (%d) is larger than the number of unique training samples (%d)." % (size_batch, num_train)
                 pass
         else:
+            assert 0. < size_batch and size_batch <= 1., "The requested fraction of samples (%.2e) is not in range (0,1]." % size_batch
             size_batch = int(size_batch * num_train)
             pass
 
@@ -98,9 +105,10 @@ def main ():
             X_batch = X_train[batch_indices,:]
             Y_batch = Y_train[batch_indices]
             W_batch = W_train[batch_indices]
+            P_batch = P_train[batch_indices]
 
             # Yield batch arrays
-            yield X_batch, Y_batch, W_batch
+            yield X_batch, Y_batch, W_batch, P_batch
 
         pass
 
@@ -109,7 +117,7 @@ def main ():
     # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––    
 
     # Fit non-adversarial neural network
-    if resume:
+    if not retrain_classifier:
         print "\n== Loading classifier model."
 
         # Load existing classifier model from file
@@ -119,132 +127,132 @@ def main ():
         print "\n== Fitting non-adversarial classifier model."
 
         # Create new classifier model instance
-        classifier = classifier_model(len(input_vars))
+        classifier = classifier_model(X.shape[1], architecture=[(128, 'tanh')] * 4)
 
         # Compile with optimiser configuration
         classifier.compile(**opts['classifier'])
 
         # Get training samples
-        X_batch, Y_batch, W_batch = sampler(replace = False).next()
+        X_batch, Y_batch, W_batch, _ = sampler(replace=False).next()
 
         # Fit classifier model
-        classifier.fit(X_batch, Y_batch, sample_weight = W_batch, batch_size = 1024, nb_epoch = 10) # 50
+        classifier.fit(X_batch, Y_batch, sample_weight=W_batch, batch_size=1024, nb_epoch=100) 
 
         # Save classifier model to file
         classifier.save('classifier.h5')
         pass
 
 
+    # Set up combined, adversarial model
+    adversarial = adversarial_model(classifier, architecture=[(64, 'tanh')] * 2, num_posterior_components=1, num_posterior_dimensions=P_train.shape[1])
 
-    # Train combined, adversarial model
-    # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––    
-
-    print "\n== Fitting combined, adversarial model."
-
-    # Get discriminator model
-    discriminator = discriminator_model(num_components = 5)
-
-    # Optionally, load checkpoints
-    if resume:
-        load_checkpoint(classifier)
-        load_checkpoint(discriminator)
+    if resume: 
+        load_checkpoint(adversarial)
         pass
 
-    # Get combined model
-    combined = combined_model(classifier, discriminator)
+    adversarial.compile(**opts['adversarial'])
 
-    # Compile models
-    classifier   .compile(**opts['classifier'])
-    combined     .compile(**opts['combined'])
-    discriminator.compile(**opts['discriminator'])
-    
-    # Plot models
-    plot(classifier,    to_file = 'classifier.png',    show_shapes = True)
-    plot(discriminator, to_file = 'discriminator.png', show_shapes = True)
-    plot(combined,      to_file = 'combined.png',      show_shapes = True)
+    # Save adversarial model diagram
+    plot(adversarial, to_file='adversarial.png', show_shapes=True)
 
-    # Initialise trainin parameters
-    N  = X_train.shape[0]
-    T  = 1000
-    M  = 1024 * 4
-    K1 =  200
-    K2 =    1
+    # Set fit options
+    fit_opts = {
+        'shuffle':          True,
+        'validation_split': 0.2,
+        'batch_size':       4 * 1024,
+        'nb_epoch':         100,
+        'sample_weight':    [W_train, np.multiply(W_train, 1. - Y_train)]
+    }
 
-    # Set damping factor
-    damp = np.power(1.0E-02, 1./float(T))
-    
-    # Loop iterations.
-    for iepoch in range(T):
+    # -- Callback for storing costs at batch-level
+    class LossHistory(Callback):
+        def on_train_begin(self, logs={}):
+            self.lossnames = ['loss', 'classifier_loss', 'adversary_loss']
+            self.losses = {name: list() for name in self.lossnames}
+            return
 
-        print "Iteration [%2d/%2d] " % (iepoch + 1, T)
-        
-        # Train discriminator model
-        # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––    
-        
-        # Train on mini-batches
-        for X_batch, Y_batch, W_batch in sampler(M, num_batches = K1):
-
-            # Get array of jet masses
-            m_batch = X_batch[:,idx_m]
-
-            # [L3]: Predict classifier without training
-            classifier_prob = classifier.predict(X_batch, verbose = 0)
-
-            # [L4]: Train discriminator separately
-            cost = discriminator.train_on_batch([classifier_prob, m_batch], np.ones_like(m_batch), sample_weight = np.multiply(W_batch, 1. - Y_batch))
-            
-            pass
-        
-
-        # Train classifier model
-        # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––    
-       
-        # Save discriminator checkpoints
-        save_checkpoint(discriminator)
-        
-        # Train on mini-batches
-        for X_batch, Y_batch, W_batch in sampler(M, num_batches = K2):
-            
-            # Get array of jet masses
-            m_batch = X_batch[:,idx_m]
-            
-            # [L7]: Train classifier separately
-            costs = combined.train_on_batch([X_batch, m_batch], [Y_batch, np.ones_like(m_batch)], sample_weight = [W_batch, np.multiply(W_batch, 1. - Y_batch)])
-            
-            # Restore discriminator, since freezing models/layers doesn't really work in combined models
-            load_checkpoint(discriminator) 
-
-            pass
-    
-        # Print
-        """
-        if (iepoch + 1) % 10 == 0:
-            #print "  Batch [%4d/%4d] d_loss : %f" % (ibatch + 1, num_batches, d_loss)
-            print "  d_loss:  %-6.3f" % ( d_loss)
-            print "  cc_loss: %-6.3f" % (cc_loss)
-            print "  cd_loss: %-6.3f" % (cd_loss)
-            print "  ct_loss: %-6.3f" % (ct_loss)
-            pass
-        """
-
-        # Save checkpoints
-        if iepoch % 10 == 9:
-            save_checkpoint(classifier)
-            save_checkpoint(discriminator)
-            pass
-
-        # Change learning rate
-        if damp < 1.:
-            K_.set_value(c_optim.lr, damp * K_.get_value(c_optim.lr))
-            K_.set_value(d_optim.lr, damp * K_.get_value(d_optim.lr))
-            pass
-
+        def on_batch_end(self, batch, logs={}):
+            for name in self.lossnames:
+                self.losses[name].append(float(logs.get(name)))
+                pass
+            return
         pass
 
+    history = LossHistory()
+
+    # -- Callback for updating learning rate(s)
+    damp = np.power(1.0E-04, 1./float(fit_opts['nb_epoch']))
+    def schedule (epoch):
+        """ Update the learning rate of the two optimisers. """
+        if 0 < damp and damp < 1:
+            K_.set_value(adv_optim.lr, damp * K_.get_value(adv_optim.lr))
+            pass
+        return float(K_.eval(adv_optim.lr))
+
+    change_lr = LearningRateScheduler(schedule)
+
+    # -- Callback for saving model checkpoints
+    from keras.callbacks import ModelCheckpoint
+    checkpointer = ModelCheckpoint(filepath=".adversarial_checkpoint.h5", verbose=0, save_best_only=False)
+
+    # -- Callback to reduce learning rate when validation loss plateaus
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1E-07)
+
+    # Store callbacks in fit options
+    fit_opts['callbacks'] = [history, change_lr, checkpointer]
+
+    # Fit the combined, adversarial model
+    adversarial.fit([X_train, P_train], [Y_train, np.ones_like(Y_train)], **fit_opts)
+    hist = history.losses
+
+    # Save cost log to file
+    with open('cost.log', 'a' if resume else 'w') as cost_log:
+        line  = "# "
+        line += ", ".join(['%s' % name for name in history.lossnames])
+        line += " \n"
+        cost_log.write(line) 
+
+        cost_array = np.squeeze(np.array(zip(hist.values())))
+        for row in range(cost_array.shape[1]):
+            costs = list(cost_array[:,row])
+            line = ', '.join(['%.4e' % cost for cost in costs])
+            line += " \n"
+            cost_log.write(line)    
+            pass
+        pass
+
+    '''
+    # Plot cost log
+    colors = [c['color'] for c in list(plt.rcParams['axes.prop_cycle'])]
+
+    for i, (key,l) in enumerate(hist.items()):
+        name = key.replace('loss', '').replace('_', '')
+        #name = name or 'combined'
+        if name:
+            name = r'$L_{%s}$' % name
+        else:
+            name = r'$L_{classifier} - \lambda L_{adversary}$'
+            pass
+        plt.plot(l, alpha=0.4, label=name, color=colors[i])
+        plt.plot(savgol_filter(l, 101, 3), color=colors[i])
+        pass
+    clf_opt = hist['classifier_loss'][0]
+    N = len(hist['classifier_loss'])
+    plt.plot([0, N - 1], [clf_opt, clf_opt], color='gray', linestyle='--')
+    plt.yscale('log')
+    plt.xlabel('Iteration')
+    plt.ylabel('Cost')
+    plt.legend()
+    plt.grid()
+    plt.show()
+    '''
+
+    # Save adversarial model (?)
+    save_architecture_and_weights(adversarial)
+    save_checkpoint(adversarial)
+    
     print "\n== Done."
     
-    # ...
-
     return
 
 
